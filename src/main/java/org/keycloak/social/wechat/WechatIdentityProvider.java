@@ -60,6 +60,7 @@ public class WechatIdentityProvider extends AbstractOAuth2IdentityProvider<Wecha
 
     private static final String AUTH_URL = "https://open.weixin.qq.com/connect/qrconnect";
     private static final String TOKEN_URL = "https://api.weixin.qq.com/sns/oauth2/access_token";
+    private static final String REFRESH_TOKEN_URL = "https://api.weixin.qq.com/sns/oauth2/refresh_token";
     private static final String USERINFO_URL = "https://api.weixin.qq.com/sns/userinfo";
 
     private static final String OAUTH2_AUTH_URL = "https://open.weixin.qq.com/connect/oauth2/authorize";
@@ -87,8 +88,16 @@ public class WechatIdentityProvider extends AbstractOAuth2IdentityProvider<Wecha
     private static final String LOGIN_TYPE = "login_type";
     private static final String EXPIRES_IN = "expires_in";
 
+    // 微信 access_token 失效类错误码（触发 refresh_token 刷新）
+    private static final int ERR_ACCESS_TOKEN_INVALID = 40001;
+    private static final int ERR_ACCESS_TOKEN_ILLEGAL = 40014;
+    private static final int ERR_ACCESS_TOKEN_EXPIRED = 42001;
+
     private static final String WECHAT_CACHE_NAME = "wechatAccessTokens";
     private static final String CACHE_LOCK_PREFIX = "__lock__";
+    // 缓存键前缀：区分小程序 client_credential token 与网页授权 token，避免同 appId 互相覆盖
+    private static final String MP_CACHE_KEY_PREFIX = "mp:";
+    private static final String SNS_CACHE_KEY_PREFIX = "sns:";
     private final Cache<String, String> tokenCache;
     private final String cacheLockMark;
 
@@ -255,10 +264,11 @@ public class WechatIdentityProvider extends AbstractOAuth2IdentityProvider<Wecha
     }
 
     private String getAccessToken(String appId) {
-        String accessToken = tokenCache.get(appId);
+        String cacheKey = MP_CACHE_KEY_PREFIX + appId;
+        String accessToken = tokenCache.get(cacheKey);
         if (accessToken == null || accessToken.startsWith(CACHE_LOCK_PREFIX)) {
             for (int i = 0; i < 15; i++) {
-                accessToken = tokenCache.computeIfAbsent(appId, k -> cacheLockMark, 10000, MILLISECONDS);
+                accessToken = tokenCache.computeIfAbsent(cacheKey, k -> cacheLockMark, 10000, MILLISECONDS);
                 if (!accessToken.startsWith(CACHE_LOCK_PREFIX)) {
                     break;
                 }
@@ -282,7 +292,7 @@ public class WechatIdentityProvider extends AbstractOAuth2IdentityProvider<Wecha
                     if (tokenResponse != null) {
                         accessToken = getJsonProperty(tokenResponse, getAccessTokenResponseParameter());
                         int expireInSeconds = Integer.parseInt(getJsonProperty(tokenResponse, EXPIRES_IN)) - 60;
-                        tokenCache.put(appId, accessToken, expireInSeconds, SECONDS);
+                        tokenCache.put(cacheKey, accessToken, expireInSeconds, SECONDS);
                         break;
                     }
                 }
@@ -296,6 +306,81 @@ public class WechatIdentityProvider extends AbstractOAuth2IdentityProvider<Wecha
     }
 
     /**
+     * 使用 refresh_token 刷新 access_token
+     */
+    private String refreshAccessToken(String appId, String refreshToken) {
+        log.info("Refreshing access token for appId: " + appId);
+        try {
+            JsonNode tokenResponse = SimpleHttp
+                    .doGet(REFRESH_TOKEN_URL, session)
+                    .param(OAUTH2_PARAMETER_CLIENT_ID, appId)
+                    .param("refresh_token", refreshToken)
+                    .param(OAUTH2_PARAMETER_GRANT_TYPE, "refresh_token")
+                    .asJson();
+
+            if (tokenResponse != null) {
+                String accessToken = getJsonProperty(tokenResponse, getAccessTokenResponseParameter());
+                String newRefreshToken = getJsonProperty(tokenResponse, "refresh_token");
+                String expiresIn = getJsonProperty(tokenResponse, EXPIRES_IN);
+
+                // 微信在 refresh_token 失效时返回错误体（errcode/errmsg，无 access_token/expires_in），
+                // 此时判定刷新失败，避免 parseInt(null) 抛 NumberFormatException 逃逸出 catch。
+                if (accessToken == null || accessToken.isEmpty()
+                        || newRefreshToken == null || newRefreshToken.isEmpty()
+                        || expiresIn == null || expiresIn.isEmpty()) {
+                    log.warn("Failed to refresh access token for appId: " + appId
+                            + ", errcode=" + getJsonProperty(tokenResponse, "errcode")
+                            + ", errmsg=" + getJsonProperty(tokenResponse, "errmsg"));
+                    return null;
+                }
+
+                int expireInSeconds = Integer.parseInt(expiresIn) - 60;
+
+                // 更新缓存中的 access_token（网页授权 token，使用 sns 前缀避免与小程序 token 冲突）
+                tokenCache.put(SNS_CACHE_KEY_PREFIX + appId, accessToken, expireInSeconds, SECONDS);
+                
+                // 返回新的 refresh_token
+                return newRefreshToken;
+            }
+        } catch (Exception e) {
+            log.error("Failed to refresh access token for appId: " + appId, e);
+        }
+        return null;
+    }
+
+    /**
+     * 判断响应是否表示 access_token 失效（需刷新）。
+     */
+    private static boolean isAccessTokenError(JsonNode response) {
+        if (response == null || !response.has("errcode")) {
+            return false;
+        }
+        int errcode = response.get("errcode").asInt();
+        return errcode == ERR_ACCESS_TOKEN_INVALID
+                || errcode == ERR_ACCESS_TOKEN_ILLEGAL
+                || errcode == ERR_ACCESS_TOKEN_EXPIRED;
+    }
+
+    /**
+     * 判断响应是否为错误响应（含非零 errcode）。
+     */
+    private static boolean isErrorResponse(JsonNode response) {
+        return response != null && response.has("errcode") && response.get("errcode").asInt() != 0;
+    }
+
+    /**
+     * 调用微信 userinfo 接口获取用户详细信息。
+     */
+    private JsonNode fetchUserInfo(String accessToken, String openId) throws IOException {
+        return SimpleHttp
+                .doGet(USERINFO_URL, session)
+                .param("access_token", accessToken)
+                .param("openid", openId)
+                .param("lang", "zh_CN")
+                .asJson();
+    }
+
+    /**
      * 获取登录信息
      */
     public BrokeredIdentityContext getFederatedIdentity(String response, WechatLoginType loginType, String appId) {
@@ -306,18 +391,76 @@ public class WechatIdentityProvider extends AbstractOAuth2IdentityProvider<Wecha
             e.printStackTrace();
             throw new IdentityBrokerException("Can't parse OAuth server response: " + response);
         }
-        log.info("User profile: " + profile.toString());
+        // 脱敏记录：profile 含 access_token/refresh_token/openid，禁止整体打印
+        log.info("User profile received for appId: " + appId);
         var context = extractIdentityFromProfile(profile, appId);
 
         String accessToken = getJsonProperty(profile, getAccessTokenResponseParameter());
+        String refreshToken = getJsonProperty(profile, "refresh_token");
+        
         if (WechatLoginType.MINI_PROGRAM.equals(loginType)) {
             accessToken = getAccessToken(appId);
         }
         if (accessToken == null) {
             throw new IdentityBrokerException("No access token available in OAuth server response: " + response);
         }
-        log.info("Access token: " + accessToken);
         context.getContextData().put(FEDERATED_ACCESS_TOKEN, accessToken);
+        
+        // 保存 refresh_token
+        if (refreshToken != null) {
+            context.getContextData().put("refresh_token", refreshToken);
+        }
+
+        // 获取用户详细信息
+        if (!WechatLoginType.MINI_PROGRAM.equals(loginType)) {
+            String openId = getJsonProperty(profile, OPEN_ID);
+            try {
+                JsonNode userInfo = fetchUserInfo(accessToken, openId);
+                
+                // 如果 access_token 过期，尝试使用 refresh_token 刷新
+                if (isAccessTokenError(userInfo)) {
+                    log.info("Access token expired, trying to refresh");
+                    String newRefreshToken = refreshAccessToken(appId, refreshToken);
+                    if (newRefreshToken != null) {
+                        // 使用新的 access_token 重试（网页授权 token，用 sns 前缀读取）
+                        accessToken = tokenCache.get(SNS_CACHE_KEY_PREFIX + appId);
+                        userInfo = fetchUserInfo(accessToken, openId);
+                        // 刷新成功：同步更新 context 中的 token，避免存储过期凭据
+                        context.getContextData().put(FEDERATED_ACCESS_TOKEN, accessToken);
+                        context.getContextData().put("refresh_token", newRefreshToken);
+                    }
+                }
+                
+                // 脱敏记录：避免将 openid/unionid/nickname 等 PII 明文写入日志
+                log.info("User info fetched, has errcode: " + userInfo.has("errcode"));
+                
+                // 设置用户详细信息
+                String nickname = getJsonProperty(userInfo, "nickname");
+                if (nickname != null) {
+                    context.setFirstName(nickname);
+                }
+                
+                String headimgurl = getJsonProperty(userInfo, "headimgurl");
+                if (headimgurl != null) {
+                    context.setUserAttribute("picture", headimgurl);
+                }
+                
+                String unionId = getJsonProperty(userInfo, UNION_ID);
+                if (unionId != null) {
+                    context.setUserAttribute(UNION_ID, unionId);
+                }
+                
+                // 仅在成功获取用户信息时存入 mapper，避免错误响应污染用户属性
+                if (isErrorResponse(userInfo)) {
+                    log.warn("User info request failed, errcode=" + userInfo.get("errcode").asInt()
+                            + ", falling back to basic profile from token response");
+                } else {
+                    AbstractJsonUserAttributeMapper.storeUserProfileForMapper(context, userInfo, getConfig().getAlias());
+                }
+            } catch (IOException e) {
+                log.error("Failed to get user info", e);
+            }
+        }
 
         return context;
     }
